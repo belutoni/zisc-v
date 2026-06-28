@@ -206,8 +206,6 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Sel
                         std.process.exit(1);
                     };
                 }
-            } else {
-                const token_arg = TokenArg.init(allocator, TokenArg.TokenArgType.)
             }
 
             tokens.append(allocator, token) catch |err| {
