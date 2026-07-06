@@ -60,23 +60,36 @@ pub const directives = [_][]const u8{
 };
 
 pub const TokenArg = struct {
+    /// The type of the argument, which can be one of the following:
+    /// - Numerical: A numeric value, which can be in decimal, hexadecimal, or binary
+    /// - Register: A register name
+    /// - Label: A label name
+    /// - StringLiteral: A string literal, which can be enclosed in double quotes
     pub const TokenArgType = enum {
         Numerical,
         Register,
         Label,
         StringLiteral,
-        DirectiveName,
     };
 
+    /// The type of the argument.
     type: TokenArgType,
+    /// The value of the argument, which is a string representation of the argument.
     value: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, arg_type: TokenArgType, value: []const u8) !TokenArg {
+    /// Allocates a new TokenArg with the given type and value.
+    /// The value is trimmed of whitespace and duplicated into the allocator.
+    pub fn init(allocator: std.mem.Allocator, arg_type: TokenArgType, value: []const u8) TokenArg {
         const clean_value = std.mem.trim(u8, value, " \t");
-        const duped_value = try allocator.dupe(u8, clean_value);
+        const duped_value = allocator.dupe(u8, clean_value) catch |err| {
+            std.debug.print("[TokenArg.init()] Error: {any}", .{err});
+            std.process.exit(1);
+        };
         return TokenArg{ .type = arg_type, .value = duped_value };
     }
 
+    /// Deinitializes the TokenArg, freeing its allocated value.
+    /// This should be called when the TokenArg is no longer needed to avoid memory leaks.
     pub fn deinit(self: TokenArg, allocator: std.mem.Allocator) void {
         allocator.free(self.value);
     }
@@ -87,38 +100,54 @@ const TokenError = error{
 };
 
 pub const Token = struct {
-    const MaxArgsLen = 3;
+    /// The type of the token, which can be one of the following:
+    /// - Directive: A directive, which starts with a dot (.)
+    /// - Mnemonic: An instruction mnemonic, which is a valid assembly instruction
+    /// - Label: A label, which ends with a colon (:)
     pub const TokenType = enum {
-        Directive, // => .data / .text / tba
-        Mnemonic, // => nop / add x2, x3, x1 / etc
-        Label, //  => label_name:
+        Directive,
+        Mnemonic,
+        Label,
     };
 
+    /// The type of the token.
     type: TokenType,
+    /// 'Name' of the token (e.g., the directive name, mnemonic name, or label name).
+    name: []const u8,
+    /// The arguments of the token, which can be zero or more.
     args: std.ArrayList(TokenArg),
+    /// The line number of the token in the source file.
     line_number: usize,
 
-    pub fn init(allocator: std.mem.Allocator, token_type: TokenType, line_number: usize) Token {
-        const args = std.ArrayList(TokenArg).initCapacity(allocator, 4) catch |err| {
+    /// Initializes a new Token with the given type and line number.
+    pub fn init(allocator: std.mem.Allocator, name: []const u8, token_type: TokenType, line_number: usize) Token {
+        const args = std.ArrayList(TokenArg).initCapacity(allocator, 2) catch |err| {
             std.debug.print("[Token.init() -> std.ArrayList(TokenArg).initCapacity()] Error: {any}", .{err});
             std.process.exit(1);
         };
+        const clean_name = std.mem.trim(u8, name, " \t");
+        const duped_name = allocator.dupe(u8, clean_name) catch |err| {
+            std.debug.print("[Token.init() -> allocator.dupe()] Error: {any}", .{err});
+            std.process.exit(1);
+        };
 
-        return Token{ .type = token_type, .args = args, .line_number = line_number };
+        return Token{ .type = token_type, .name = duped_name, .args = args, .line_number = line_number };
     }
 
+    /// Adds an argument to the token.
     pub fn addArgument(self: *Token, allocator: std.mem.Allocator, token: TokenArg) !void {
         try self.args.append(allocator, token);
     }
 
+    /// Validates the token based on its type and arguments.
     pub fn validate(self: Token) bool {
         if (self.type == Token.TokenType.Mnemonic) {
-            return self.args.len <= 3;
+            return self.args.items.len <= 3;
         }
 
-        // Can have an infinite amount of arguments (with ArgType != Register)
+        // Can have an infinite amount of arguments (+ ArgType != Register)
         if (self.type == Token.TokenType.Directive) {
-            for (self.args) |arg| {
+            for (self.args.items) |arg| {
                 if (arg.type == TokenArg.TokenArgType.Register) {
                     return false;
                 }
@@ -127,25 +156,31 @@ pub const Token = struct {
             return true;
         }
 
-        return self.args.len == 0;
+        return self.args.items.len == 0;
     }
 
+    /// Deinitializes the Token, freeing its arguments.
     pub fn deinit(self: *Token, allocator: std.mem.Allocator) void {
         self.args.deinit(allocator);
+        allocator.free(self.name);
     }
 };
 
 // <Struct fields>
+/// The Lexer struct is responsible for tokenizing the input assembly code.
+/// It reads the input file, processes each line, and generates a list of tokens.
+/// The tokens can be directives, mnemonics, or labels, and each token can have zero or more arguments.
 tokens: std.ArrayList(Token),
+
+/// Initializes the Lexer by reading the input file and tokenizing its contents.
 pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Self {
-    // Read file
     const contents = std.Io.Dir.cwd().readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
         std.debug.print("[Lexer.init() -> std.Io.Dir.cwd().readFileAlloc()] Error: {any}", .{err});
         std.process.exit(1);
     };
     defer allocator.free(contents);
 
-    var tokens = std.ArrayList(Token).initCapacity(allocator, 64) catch |err| {
+    var tokens = std.ArrayList(Token).initCapacity(allocator, 512) catch |err| {
         std.debug.print("[Lexer.init() -> std.ArrayList(Token).initCapacity()] Error: {any}", .{err});
         std.process.exit(1);
     };
@@ -157,28 +192,26 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Sel
         const carriage_stripped_line = std.mem.trimEnd(u8, line, "\r");
         const trimmed_line = std.mem.trim(u8, carriage_stripped_line, " \t");
 
-        // Empty line
         if (trimmed_line.len == 0)
             continue;
 
-        // Commentary
         if (std.mem.startsWith(u8, trimmed_line, "#"))
             continue;
 
         // Remove commentary from the end of the line
-        const commentary_start = std.mem.findPos(u8, trimmed_line, 0, "#");
-        var commentary_clean_line = trimmed_line;
-        if (commentary_start) |line_end| {
-            commentary_clean_line = std.mem.trimEnd(u8, trimmed_line[0..line_end], " \t");
+        const comment_start = std.mem.findPos(u8, trimmed_line, 0, "#");
+        var line_without_comment = trimmed_line;
+        if (comment_start) |line_end| {
+            line_without_comment = std.mem.trimEnd(u8, trimmed_line[0..line_end], " \t");
         }
 
-        if (commentary_clean_line.len < 2) {
-            std.debug.print("[Lexer Error] Length of line is too short ({s}) for it to mean anything.", .{line});
+        if (line_without_comment.len < 2) {
+            std.debug.print("[Error] Line: {d} Length of line is too short ({s}) for it to mean anything.", .{ line_number, line });
             std.process.exit(1);
         }
 
-        const clean_line = std.ascii.allocLowerString(allocator, commentary_clean_line) catch |err| {
-            std.debug.print("[Lexer.init() -> std.ascii.allocLowerString()] Error: {any}", .{err});
+        const clean_line = std.ascii.allocLowerString(allocator, line_without_comment) catch |err| {
+            std.debug.print("[Lexer.init() -> std.ascii.allocLowerString()] Line: {d} \\ Error: {any}", .{ line_number, err });
             std.process.exit(1);
         };
         defer allocator.free(clean_line);
@@ -186,21 +219,23 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Sel
         // Directive
         if (std.mem.startsWith(u8, clean_line, ".")) {
             if (!isDirective(clean_line)) {
-                std.debug.print("[Lexer Error] Line starts with '.', making it a directive, but has an illegal format: {s}", .{line});
+                std.debug.print("[Error] Line: {d} starts with '.', making it a directive, but has an illegal format: {s}", .{ line_number, line });
                 std.process.exit(1);
             }
 
             const first_space = std.mem.findPos(u8, clean_line, 0, " ");
-            var token = Token.init(allocator, Token.TokenType.Directive, line_number);
+            var token: Token = if (first_space) |start_index|
+                Token.init(allocator, clean_line[0..start_index], Token.TokenType.Directive, line_number)
+            else
+                Token.init(allocator, clean_line, Token.TokenType.Directive, line_number);
+
             if (first_space) |start_index| {
-                var directive_iterator = std.mem.splitScalar(u8, clean_line[start_index..], ',');
-                while (directive_iterator.next()) |directive_arg| {
-                    const clean_directive_arg = std.mem.trim(u8, directive_arg, " \t");
-                    const arg_type = if (isLabel(clean_directive_arg)) TokenArg.TokenArgType.Label else TokenArg.TokenArgType.Numerical;
-                    const token_arg = TokenArg.init(allocator, arg_type, clean_directive_arg) catch |err| {
-                        std.debug.print("[Lexer.init() -> token_arg.init()] Error: {any}", .{err});
-                        std.process.exit(1);
-                    };
+                var iterator = std.mem.splitScalar(u8, clean_line[start_index..], ',');
+                while (iterator.next()) |argument| {
+                    const clean_argument = std.mem.trim(u8, argument, " \t");
+                    const arg_type = if (isLabel(clean_argument)) TokenArg.TokenArgType.Label else TokenArg.TokenArgType.Numerical;
+
+                    const token_arg = TokenArg.init(allocator, arg_type, clean_argument);
                     token.addArgument(allocator, token_arg) catch |err| {
                         std.debug.print("[Lexer.init() -> token.addArgument()] Error: {any}", .{err});
                         std.process.exit(1);
@@ -218,19 +253,11 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Sel
         // Label
         if (std.mem.endsWith(u8, clean_line, ":")) {
             if (!isLabel(clean_line[0..(clean_line.len - 1)])) {
-                std.debug.print("[Lexer Error] Line ends with ':', making it a label, but has an illegal format: {s}", .{line});
+                std.debug.print("[Lexer Error] Line: {d} ends with ':', making it a label, but has an illegal format: {s}", .{ line_number, line });
                 std.process.exit(1);
             }
 
-            const token_arg = TokenArg.init(allocator, TokenArg.TokenArgType.Label, clean_line[0..(clean_line.len - 1)]) catch |err| {
-                std.debug.print("[Lexer.init() -> token_arg.init()] Error: {any}", .{err});
-                std.process.exit(1);
-            };
-            var token = Token.init(allocator, Token.TokenType.Label, line_number);
-            token.addArgument(allocator, token_arg) catch |err| {
-                std.debug.print("[Lexer.init() -> token.addArgument()] Error: {any}", .{err});
-                std.process.exit(1);
-            };
+            const token = Token.init(allocator, clean_line[0..(clean_line.len - 1)], Token.TokenType.Label, line_number);
             tokens.append(allocator, token) catch |err| {
                 std.debug.print("[Lexer.init() -> tokens.append()] Error: {any}", .{err});
                 std.process.exit(1);
@@ -244,6 +271,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Sel
     return Self{ .tokens = tokens };
 }
 
+/// Checks if the given line is a directive by comparing it against known directives.
 pub fn isDirective(line: []const u8) bool {
     for (directives) |directive| {
         if (std.mem.startsWith(u8, line, directive)) {
@@ -254,6 +282,7 @@ pub fn isDirective(line: []const u8) bool {
     return false;
 }
 
+/// Checks if the given line is a valid label according to assembly language rules.
 pub fn isLabel(line: []const u8) bool {
     // Can only start with alphabetic characters, must NOT contain spaces
     // and must have only digits, underscore and alphabetic characters inside
@@ -279,6 +308,7 @@ pub fn isLabel(line: []const u8) bool {
     return true;
 }
 
+/// Deinitializes the Lexer, freeing its tokens and their arguments.
 pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     for (self.tokens.items) |*token| {
         for (token.args.items) |*arg| {
