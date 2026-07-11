@@ -1,70 +1,17 @@
+/// The lexer is responsible for transforming the given source file
+/// into meaningful tokens.
+///
+/// The source file is loaded into memory and must be alive for the entire
+/// life of the assembler.
 const std = @import("std");
-
-// All files are structs in Zig so we get the 'type' of the current file
-// to be able to return an initialized object back
 const Self = @This();
-
-pub const directives = [_][]const u8{
-    ".option",
-    ".insn",
-    ".attribute",
-    ".dtprelword",
-    ".dtpreldword",
-    ".sleb128",
-    ".uleb128",
-
-    // Data and Memory Allocation
-    ".byte",
-    ".half",
-    ".short",
-    ".word",
-    ".int",
-    ".dword",
-    ".quad",
-    ".float",
-    ".double",
-    ".ascii",
-    ".asciz",
-    ".string",
-    ".zero",
-    ".space",
-
-    // Sections and Alignment
-    ".text",
-    ".data",
-    ".rodata",
-    ".bss",
-    ".section",
-    ".align",
-    ".balign",
-    ".p2align",
-
-    // Symbol Visibility and Typing
-    ".global",
-    ".globl",
-    ".local",
-    ".extern",
-    ".type",
-    ".size",
-    ".equ",
-    ".set",
-
-    // Macros and Conditionals
-    ".macro",
-    ".endm",
-    ".if",
-    ".else",
-    ".elif",
-    ".endif",
-    ".include",
-};
 
 pub const TokenArg = struct {
     /// The type of the argument, which can be one of the following:
     /// - Numerical: A numeric value, which can be in decimal, hexadecimal, or binary
-    /// - Register: A register name
-    /// - Label: A label name
-    /// - StringLiteral: A string literal, which can be enclosed in double quotes
+    /// - Register
+    /// - Label
+    /// - StringLiteral
     pub const TokenArgType = enum {
         Numerical,
         Register,
@@ -74,24 +21,16 @@ pub const TokenArg = struct {
 
     /// The type of the argument.
     type: TokenArgType,
-    /// The value of the argument, which is a string representation of the argument.
+    /// String representation of the argument.
     value: []const u8,
 
-    /// Allocates a new TokenArg with the given type and value.
-    /// The value is trimmed of whitespace and duplicated into the allocator.
-    pub fn init(allocator: std.mem.Allocator, arg_type: TokenArgType, value: []const u8) TokenArg {
+    /// Creates a new TokenArg with the given TokenArgType and string representation
+    /// of the value.
+    ///
+    /// Also performs a trim on the given value
+    pub fn init(arg_type: TokenArgType, value: []const u8) TokenArg {
         const clean_value = std.mem.trim(u8, value, " \t");
-        const duped_value = allocator.dupe(u8, clean_value) catch |err| {
-            std.debug.print("[TokenArg.init()] Error: {any}", .{err});
-            std.process.exit(1);
-        };
-        return TokenArg{ .type = arg_type, .value = duped_value };
-    }
-
-    /// Deinitializes the TokenArg, freeing its allocated value.
-    /// This should be called when the TokenArg is no longer needed to avoid memory leaks.
-    pub fn deinit(self: TokenArg, allocator: std.mem.Allocator) void {
-        allocator.free(self.value);
+        return TokenArg{ .type = arg_type, .value = clean_value };
     }
 };
 
@@ -120,18 +59,13 @@ pub const Token = struct {
     line_number: usize,
 
     /// Initializes a new Token with the given type and line number.
-    pub fn init(allocator: std.mem.Allocator, name: []const u8, token_type: TokenType, line_number: usize) Token {
-        const args = std.ArrayList(TokenArg).initCapacity(allocator, 2) catch |err| {
-            std.debug.print("[Token.init() -> std.ArrayList(TokenArg).initCapacity()] Error: {any}", .{err});
-            std.process.exit(1);
-        };
+    ///
+    /// Also performs a trim on the given value
+    pub fn init(allocator: std.mem.Allocator, name: []const u8, token_type: TokenType, line_number: usize) !Token {
+        const args = std.ArrayList(TokenArg).initCapacity(allocator, 0);
         const clean_name = std.mem.trim(u8, name, " \t");
-        const duped_name = allocator.dupe(u8, clean_name) catch |err| {
-            std.debug.print("[Token.init() -> allocator.dupe()] Error: {any}", .{err});
-            std.process.exit(1);
-        };
 
-        return Token{ .type = token_type, .name = duped_name, .args = args, .line_number = line_number };
+        return Token{ .type = token_type, .name = clean_name, .args = args, .line_number = line_number };
     }
 
     /// Adds an argument to the token.
@@ -139,50 +73,32 @@ pub const Token = struct {
         try self.args.append(allocator, token);
     }
 
-    /// Validates the token based on its type and arguments.
-    pub fn validate(self: Token) bool {
-        if (self.type == Token.TokenType.Mnemonic) {
-            return self.args.items.len <= 3;
-        }
-
-        // Can have an infinite amount of arguments (+ ArgType != Register)
-        if (self.type == Token.TokenType.Directive) {
-            for (self.args.items) |arg| {
-                if (arg.type == TokenArg.TokenArgType.Register) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        return self.args.items.len == 0;
-    }
-
     /// Deinitializes the Token, freeing its arguments.
     pub fn deinit(self: *Token, allocator: std.mem.Allocator) void {
         self.args.deinit(allocator);
-        allocator.free(self.name);
     }
 };
 
+const LexerError = error{
+    LineTooShort,
+};
+
+const State = enum { START, SYM_READ, DIR_READ, NUM_DEC, NUM_HEX, NUM_BIN, NUM_OCT, NEG_SIGN, OFFSET_READ, PARANTHESIS_READ, REG_READ, PARANTHESIS_CLOSE, STRING, ERROR };
+
 // <Struct fields>
-/// The Lexer struct is responsible for tokenizing the input assembly code.
-/// It reads the input file, processes each line, and generates a list of tokens.
-/// The tokens can be directives, mnemonics, or labels, and each token can have zero or more arguments.
+source_file_buffer: []const u8,
 tokens: std.ArrayList(Token),
 
 /// Initializes the Lexer by reading the input file and tokenizing its contents.
 pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Self {
     const contents = std.Io.Dir.cwd().readFileAlloc(io, filename, allocator, .unlimited) catch |err| {
         std.debug.print("[Lexer.init() -> std.Io.Dir.cwd().readFileAlloc()] Error: {any}", .{err});
-        std.process.exit(1);
+        return err;
     };
-    defer allocator.free(contents);
 
-    var tokens = std.ArrayList(Token).initCapacity(allocator, 512) catch |err| {
+    var tokens = std.ArrayList(Token).initCapacity(allocator, 0) catch |err| {
         std.debug.print("[Lexer.init() -> std.ArrayList(Token).initCapacity()] Error: {any}", .{err});
-        std.process.exit(1);
+        return err;
     };
 
     var line_number: usize = 1;
@@ -200,120 +116,212 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, filename: []const u8) !Sel
 
         // Remove commentary from the end of the line
         const comment_start = std.mem.findPos(u8, trimmed_line, 0, "#");
-        var line_without_comment = trimmed_line;
+        var clean_line = trimmed_line;
         if (comment_start) |line_end| {
-            line_without_comment = std.mem.trimEnd(u8, trimmed_line[0..line_end], " \t");
+            clean_line = std.mem.trimEnd(u8, trimmed_line[0..line_end], " \t");
         }
 
-        if (line_without_comment.len < 2) {
+        if (clean_line.len < 2) {
             std.debug.print("[Error] Line: {d} Length of line is too short ({s}) for it to mean anything.", .{ line_number, line });
-            std.process.exit(1);
+            return LexerError.LineTooShort;
         }
 
-        const clean_line = std.ascii.allocLowerString(allocator, line_without_comment) catch |err| {
-            std.debug.print("[Lexer.init() -> std.ascii.allocLowerString()] Line: {d} \\ Error: {any}", .{ line_number, err });
-            std.process.exit(1);
-        };
-        defer allocator.free(clean_line);
+        // Deterministic Finite Automaton
+        var cursor: usize = 0;
+        var token_start: usize = 0;
+        var state: State = State.START;
+        var current_token: ?Token = null;
+        while (cursor < clean_line.len) : (cursor += 1) {
+            switch (state) {
+                .START => {
+                    const c = clean_line[cursor];
+                    if (c == ' ' or c == '\t' or c == ',') {
+                        continue;
+                    }
 
-        // Directive
-        if (std.mem.startsWith(u8, clean_line, ".")) {
-            if (!isDirective(clean_line)) {
-                std.debug.print("[Error] Line: {d} starts with '.', making it a directive, but has an illegal format: {s}", .{ line_number, line });
-                std.process.exit(1);
+                    if (c == '.') {
+                        token_start = cursor;
+                        state = .DIR_READ;
+                    } else if (std.ascii.isAlphabetic(c) or c == '_') {
+                        token_start = cursor;
+                        state = .SYM_READ;
+                    } else if (c == '-') {
+                        token_start = cursor;
+                        state = .NEG_SIGN;
+                    } else if (c == '0') {
+                        token_start = cursor;
+                        state = .NUM_DEC;
+                    } else if (std.ascii.isDigit(c)) {
+                        token_start = cursor;
+                        state = .NUM_DEC;
+                    } else if (c == '"') {
+                        token_start = cursor;
+                        state = .STRING;
+                    } else {
+                        state = .ERROR;
+                    }
+                },
+
+                .SYM_READ => {
+                    const c = clean_line[cursor];
+                    if (std.ascii.isAlphanumeric(c) or c == '_') {
+                        if (cursor + 1 == clean_line.len) {
+                            const sym_slice = clean_line[token_start..(cursor + 1)];
+                            try handleFinishedSymbol(allocator, sym_slice, line_number, &current_token);
+                            state = .START;
+                        }
+                    } else if (c == ':') {
+                        const label_slice = clean_line[token_start..cursor];
+                        const label_token = try Token.init(allocator, label_slice, .Label, line_number);
+                        try tokens.append(allocator, label_token);
+                        state = .START;
+                    } else {
+                        const sym_slice = clean_line[token_start..cursor];
+                        try handleFinishedSymbol(allocator, sym_slice, line_number, &current_token);
+                        cursor -= 1;
+                        state = .START;
+                    }
+                },
+
+                .DIR_READ => {
+                    const c = clean_line[cursor];
+                    if (std.ascii.isAlphanumeric(c) or c == '_') {
+                        if (cursor + 1 == clean_line.len) {
+                            const dir_slice = clean_line[token_start..(cursor + 1)];
+                            current_token = try Token.init(allocator, dir_slice, .Directive, line_number);
+                            state = .START;
+                        }
+                    } else {
+                        const dir_slice = clean_line[token_start..cursor];
+                        current_token = try Token.init(allocator, dir_slice, .Directive, line_number);
+                        cursor -= 1;
+                        state = .START;
+                    }
+                },
+
+                .NEG_SIGN => {
+                    const c = clean_line[cursor];
+                    if (std.ascii.isDigit(c)) {
+                        state = .NUM_DEC;
+                    } else {
+                        state = .ERROR;
+                    }
+                },
+
+                .NUM_DEC => {
+                    const c = clean_line[cursor];
+                    if (cursor == token_start + 1 and clean_line[token_start] == '0') {
+                        if (c == 'x' or c == 'X') { state = .NUM_HEX; continue; }
+                        if (c == 'b' or c == 'B') { state = .NUM_BIN; continue; }
+                        if (c == 'o' or c == 'O') { state = .NUM_OCT; continue; }
+                    }
+
+                    if (std.ascii.isDigit(c)) {
+                        if (cursor + 1 == clean_line.len) {
+                            const num_slice = clean_line[token_start..(cursor + 1)];
+                            try handleFinishedNumerical(allocator, num_slice, &current_token);
+                            state = .START;
+                        }
+                    } else {
+                        const num_slice = clean_line[token_start..cursor];
+                        try handleFinishedNumerical(allocator, num_slice, &current_token);
+                        cursor -= 1;
+                        state = .START;
+                    }
+                },
+
+                .NUM_BIN => {
+                    const c = clean_line[cursor];
+                    if (c == '0' or c == '1') {
+                        if (cursor + 1 == clean_line.len) {
+                            const num_slice = clean_line[token_start..(cursor + 1)];
+                            try handleFinishedNumerical(allocator, num_slice, &current_token);
+                            state = .START;
+                        }
+                    } else {
+                        const num_slice = clean_line[token_start..cursor];
+                        try handleFinishedNumerical(allocator, num_slice, &current_token);
+                        cursor -= 1;
+                        state = .START;
+                    }    
+                },
+
+                .NUM_HEX => {
+                    const c = clean_line[cursor];
+                    if (std.ascii.isHex(c)) {
+                        if (cursor + 1 == clean_line.len) {
+                            const num_slice = clean_line[token_start..(cursor + 1)];
+                            try handleFinishedNumerical(allocator, num_slice, &current_token);
+                            state = .START;
+                        }
+                    } else {
+                        const num_slice = clean_line[cursor];
+                        try handleFinishedNumerical(allocator, num_slice, &current_token);
+                        cursor -= 1;
+                        state = .START;
+                    }
+                },
+
+                .NUM_OCT => {
+                    const c = clean_line[cursor];
+                    if (c >= '0' and c <= '7') {
+                        if (cursor + 1 == clean_line.len) {
+                            const num_slice = clean_line[token_start..(cursor + 1)];
+                            try handleFinishedNumerical(allocator, num_slice, &current_token);
+                            state = .START;
+                        }
+                    } else {
+                        const num_slice = clean_line[cursor];
+                        try handleFinishedNumerical(allocator, num_slice, &current_token);
+                        cursor -= 1;
+                        state = .START;
+                    }
+                },
+
+                .STRING => {
+                    const c = clean_line[cursor];
+                    // todo()
+                    if (c == '"' and clean_line[cursor-1] != '\\') {
+                        if (current_token == null) {
+                            state = .ERROR;
+                            continue;
+                        }
+
+                        const string_slice = clean_line[token_start..cursor];
+                        const arg = TokenArg.init(.StringLiteral, string_slice);
+                        try current_token.?.addArgument(allocator, arg);
+                        state = .START;
+                    }
+                },
             }
-
-            const first_space = std.mem.findPos(u8, clean_line, 0, " ");
-            var token: Token = if (first_space) |start_index|
-                Token.init(allocator, clean_line[0..start_index], Token.TokenType.Directive, line_number)
-            else
-                Token.init(allocator, clean_line, Token.TokenType.Directive, line_number);
-
-            if (first_space) |start_index| {
-                var iterator = std.mem.splitScalar(u8, clean_line[start_index..], ',');
-                while (iterator.next()) |argument| {
-                    const clean_argument = std.mem.trim(u8, argument, " \t");
-                    const arg_type = if (isLabel(clean_argument)) TokenArg.TokenArgType.Label else TokenArg.TokenArgType.Numerical;
-
-                    const token_arg = TokenArg.init(allocator, arg_type, clean_argument);
-                    token.addArgument(allocator, token_arg) catch |err| {
-                        std.debug.print("[Lexer.init() -> token.addArgument()] Error: {any}", .{err});
-                        std.process.exit(1);
-                    };
-                }
-            }
-
-            tokens.append(allocator, token) catch |err| {
-                std.debug.print("[Token.init() -> tokens.append()] Error: {any}", .{err});
-                std.process.exit(1);
-            };
-            continue;
         }
-
-        // Label
-        if (std.mem.endsWith(u8, clean_line, ":")) {
-            if (!isLabel(clean_line[0..(clean_line.len - 1)])) {
-                std.debug.print("[Lexer Error] Line: {d} ends with ':', making it a label, but has an illegal format: {s}", .{ line_number, line });
-                std.process.exit(1);
-            }
-
-            const token = Token.init(allocator, clean_line[0..(clean_line.len - 1)], Token.TokenType.Label, line_number);
-            tokens.append(allocator, token) catch |err| {
-                std.debug.print("[Lexer.init() -> tokens.append()] Error: {any}", .{err});
-                std.process.exit(1);
-            };
-            continue;
-        }
-
-        // Operation
     }
 
     return Self{ .tokens = tokens };
 }
 
-/// Checks if the given line is a directive by comparing it against known directives.
-pub fn isDirective(line: []const u8) bool {
-    for (directives) |directive| {
-        if (std.mem.startsWith(u8, line, directive)) {
-            return true;
-        }
+fn handleFinishedSymbol(allocator: std.mem.Allocator, slice: []const u8, line_number: usize, current_token: *?Token) !void {
+    if (current_token.* == null) {
+        current_token.* = try Token.init(allocator, slice, .Mnemonic, line_number);
+        return;
     }
 
-    return false;
+    const arg = TokenArg.init(.Register, slice);
+    try current_token.*.?.addArgument(allocator, arg);
 }
 
-/// Checks if the given line is a valid label according to assembly language rules.
-pub fn isLabel(line: []const u8) bool {
-    // Can only start with alphabetic characters, must NOT contain spaces
-    // and must have only digits, underscore and alphabetic characters inside
-    if (line.len == 0) {
-        return false;
+fn handleFinishedNumerical(allocator: std.mem.Allocator, slice: []const u8, line_number: usize, current_token: *?Token) !void {
+    if (current_token.* == null) {
+        return LexerError.LineTooShort; // todo
     }
 
-    if (!std.ascii.isAlphabetic(line[0]) and line[0] != '_') {
-        return false;
-    }
-
-    // We can run the loop since line.len >= 3
-    for (line[1..]) |char| {
-        if (char == ' ') {
-            return false;
-        }
-
-        if (!std.ascii.isAlphanumeric(char) and char != '_') {
-            return false;
-        }
-    }
-
-    return true;
+    const arg = TokenArg.init(.Numerical, slice);
+    try current_token.*.?.addArgument(allocator, arg); 
 }
 
-/// Deinitializes the Lexer, freeing its tokens and their arguments.
+/// Deinitializes the Lexer, freeing its tokens.
 pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
     for (self.tokens.items) |*token| {
-        for (token.args.items) |*arg| {
-            arg.deinit(allocator);
-        }
         token.deinit(allocator);
     }
 
